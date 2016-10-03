@@ -18,8 +18,7 @@
 package monix.execution.schedulers
 
 import monix.execution.Scheduler
-
-import scala.annotation.tailrec
+import scala.concurrent.{BlockContext, CanAwait}
 import scala.util.control.NonFatal
 
 /** Adds trampoline execution capabilities to
@@ -32,26 +31,21 @@ import scala.util.control.NonFatal
   * current thread.
   *
   * This is useful for light-weight callbacks. The idea is
-  * borrowed from the implementation of
-  * `scala.concurrent.Future`, except that in this case we
-  * don't care about a blocking context, the implementation
-  * being more light-weight.
-  *
+  * borrowed from the implementation of `scala.concurrent.Future`.
   * Currently used as an optimization by `Task` in processing
   * its internal callbacks.
   */
 trait LocalBatchingExecutor extends Scheduler {
   private[this] val localTasks = new ThreadLocal[List[Runnable]]()
+
   protected def executeAsync(r: Runnable): Unit
 
-  override final def execute(runnable: Runnable): Unit =
+  final def execute(runnable: Runnable): Unit =
     runnable match {
       case _: LocalRunnable =>
-        localTasks.get match {
+        localTasks.get() match {
           case null =>
-            // If we aren't in local mode yet, start local loop
-            localTasks.set(Nil)
-            localRunLoop(runnable, Nil)
+            executeAsync(new Batch(runnable, Nil))
           case some =>
             // If we are already in batching mode, add to stack
             localTasks.set(runnable :: some)
@@ -61,44 +55,64 @@ trait LocalBatchingExecutor extends Scheduler {
         executeAsync(runnable)
     }
 
-  @tailrec private def localRunLoop(head: Runnable, tail: List[Runnable]): Unit = {
-    try {
-      head.run()
-    } catch {
-      case ex: Throwable =>
-        // Sending everything to the underlying context,
-        // so that we can throw
-        val remaining = tail ::: localTasks.get()
-        localTasks.set(null)
-        forkTheRest(remaining)
-        if (NonFatal(ex)) reportFailure(ex) else throw ex
-    }
+  private final class Batch(runHead: Runnable, runTail: List[Runnable])
+    extends Runnable with BlockContext {
 
-    tail match {
-      case h2 :: t2 => localRunLoop(h2, t2)
-      case Nil =>
-        localTasks.get() match {
-          case null => ()
-          case Nil =>
-            localTasks.set(null)
-          case h2 :: t2 =>
-            localTasks.set(Nil)
-            localRunLoop(h2, t2)
+    private[this] var cachedBatch: List[Runnable] = runTail
+    private[this] var parentBlockContext: BlockContext = null
+
+    def run(): Unit = {
+      parentBlockContext = BlockContext.current
+      BlockContext.withBlockContext(this) {
+        try {
+          runLoop(runHead)
         }
-    }
-  }
-
-  private def forkTheRest(rest: List[Runnable]): Unit = {
-    final class ResumeRun(head: Runnable, tail: List[Runnable]) extends Runnable {
-      def run(): Unit = {
-        localTasks.set(Nil)
-        localRunLoop(head,tail)
+        finally {
+          parentBlockContext = null
+        }
       }
     }
 
-    rest match {
-      case null | Nil => ()
-      case head :: tail => executeAsync(new ResumeRun(head, tail))
+    def blockOn[T](thunk: => T)(implicit permission: CanAwait): T = {
+      forkTheRest(Nil)
+      parentBlockContext.blockOn(thunk)
+    }
+
+    def runLoop(r: Runnable): Unit = {
+      try r.run() catch {
+        case ex: Throwable =>
+          forkTheRest(null)
+          if (NonFatal(ex)) reportFailure(ex) else throw ex
+      }
+
+      cachedBatch match {
+        case head :: tail =>
+          cachedBatch = tail
+          runLoop(head)
+        case Nil =>
+          localTasks.get() match {
+            case head :: tail =>
+              localTasks.set(Nil)
+              cachedBatch = tail
+              runLoop(head)
+            case Nil =>
+              localTasks.set(null)
+            case null =>
+              () // do nothing else
+          }
+      }
+    }
+
+    def forkTheRest(newLocalTasks: Nil.type): Unit = {
+      val remaining = cachedBatch ::: localTasks.get()
+      localTasks.set(newLocalTasks)
+      cachedBatch = Nil
+
+      remaining match {
+        case null | Nil => ()
+        case head :: tail =>
+          executeAsync(new Batch(head, tail))
+      }
     }
   }
 }
